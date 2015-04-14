@@ -1,0 +1,213 @@
+diff -Naur suhosin-0.9.31.org/config.m4 suhosin-0.9.31/config.m4
+--- suhosin-0.9.31.org/config.m4    2010-03-28 22:43:13.000000000 +0200
++++ suhosin-0.9.31/config.m4    2010-04-18 15:56:25.000000000 +0200
+@@ -5,5 +5,5 @@
+ [  --enable-suhosin        Enable suhosin support])
+ 
+ if test "$PHP_SUHOSIN" != "no"; then
+-  PHP_NEW_EXTENSION(suhosin, suhosin.c crypt.c crypt_blowfish.c sha256.c memory_limit.c treat_data.c ifilter.c post_handler.c ufilter.c rfc1867.c log.c header.c execute.c ex_imp.c session.c aes.c compat_snprintf.c, $ext_shared)
++  PHP_NEW_EXTENSION(suhosin, suhosin.c crypt.c crypt_blowfish.c sha256.c memory_limit.c treat_data.c ifilter.c post_handler.c ufilter.c rfc1867.c log.c header.c execute.c ex_imp.c session.c aes.c compat_snprintf.c secureconfig.c, $ext_shared)
+ fi
+diff -Naur suhosin-0.9.31.org/config.w32 suhosin-0.9.31/config.w32
+--- suhosin-0.9.31.org/config.w32   2010-03-28 22:43:13.000000000 +0200
++++ suhosin-0.9.31/config.w32   2010-04-18 15:56:25.000000000 +0200
+@@ -4,7 +4,7 @@
+ ARG_ENABLE("suhosin", "whether to enable suhosin support", "yes");
+ 
+ if (PHP_SUHOSIN == "yes") {
+-   EXTENSION("suhosin", "suhosin.c crypt.c crypt_blowfish.c sha256.c memory_limit.c treat_data.c ifilter.c post_handler.c ufilter.c rfc1867.c log.c header.c execute.c ex_imp.c session.c aes.c");
++   EXTENSION("suhosin", "suhosin.c crypt.c crypt_blowfish.c sha256.c memory_limit.c treat_data.c ifilter.c post_handler.c ufilter.c rfc1867.c log.c header.c execute.c ex_imp.c session.c aes.c secureconfig.c");
+    if (PHP_SUHOSIN_SHARED) {
+        ADD_SOURCES(configure_module_dirname, "crypt_win32.c crypt_md5.c", "suhosin");
+    }
+diff -Naur suhosin-0.9.31.org/php_suhosin.h suhosin-0.9.31/php_suhosin.h
+--- suhosin-0.9.31.org/php_suhosin.h    2010-03-28 22:43:13.000000000 +0200
++++ suhosin-0.9.31/php_suhosin.h    2010-04-18 15:56:25.000000000 +0200
+@@ -214,6 +214,8 @@
+    long        cookie_checkraddr;
+    HashTable *cookie_plainlist;
+    HashTable *cookie_cryptlist;
++
++   char*   secureconfig_cryptkey;
+   
+    zend_bool   coredump;
+    zend_bool   apc_bug_workaround;
+@@ -329,6 +331,7 @@
+ void normalize_varname(char *varname);
+ int suhosin_rfc1867_filter(unsigned int event, void *event_data, void **extra TSRMLS_DC);
+ void suhosin_bailout(TSRMLS_D);
++void suhosin_hook_secureconfig();
+ 
+ /* Add pseudo refcount macros for PHP version < 5.3 */
+ #ifndef Z_REFCOUNT_PP
+diff -Naur suhosin-0.9.31.org/secureconfig.c suhosin-0.9.31/secureconfig.c
+--- suhosin-0.9.31.org/secureconfig.c   1970-01-01 01:00:00.000000000 +0100
++++ suhosin-0.9.31/secureconfig.c   2010-04-18 16:20:33.000000000 +0200
+@@ -0,0 +1,133 @@
++/*
++  +----------------------------------------------------------------------+
++  | Suhosin Version 1                                                    |
++  +----------------------------------------------------------------------+
++  | Copyright (c) 2006-2007 The Hardened-PHP Project                     |
++  | Copyright (c) 2007-2010 SektionEins GmbH                             |
++  +----------------------------------------------------------------------+
++  | This source file is subject to version 3.01 of the PHP license,      |
++  | that is bundled with this package in the file LICENSE, and is        |
++  | available through the world-wide-web at the following url:           |
++  | http://www.php.net/license/3_01.txt                                  |
++  | If you did not receive a copy of the PHP license and are unable to   |
++  | obtain it through the world-wide-web, please send a note to          |
++  | license@php.net so we can mail you a copy immediately.               |
++  +----------------------------------------------------------------------+
++  | Author: Juergen Pabel <jpabel@akkaya.de>                             |
++  +----------------------------------------------------------------------+
++*/
++
++#include <stdio.h>
++#include "php.h"
++#include "php_suhosin.h"
++#include "sha256.h"
++
++static char cryptkey[32];
++
++/* {{{ proto string secureconfig_encrypt(string plaintext)
++   Encrypt a configuration value using the configured cryptographic key */
++static PHP_FUNCTION(suhosin_secureconfig_encrypt)
++{
++   char *plaintext, *ciphertext;
++   int plaintext_len, ciphertext_len;
++   int i;
++   if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &plaintext, &plaintext_len) == FAILURE) {
++       return;
++   }
++   ciphertext = suhosin_encrypt_string(plaintext, plaintext_len, "", 0, cryptkey TSRMLS_CC);
++   if(ciphertext == NULL) {
++       return;
++   }
++   ciphertext_len = strlen(ciphertext);
++   /* undo suhosin_encrypt_string()'s base64 alphabet transformation */
++   for (i=0; i<ciphertext_len; i++) {
++       switch (ciphertext[i]) {
++           case '-': ciphertext[i]='/'; break;
++           case '.': ciphertext[i]='='; break;
++           case '_': ciphertext[i]='+'; break;
++       }
++   }
++   RETURN_STRINGL((char *)ciphertext, ciphertext_len, 1);
++}
++
++/* }}} */
++
++
++/* {{{ proto string secureconfig_decrypt(string ciphertext)
++   Decrypt a configuration value using the configured cryptographic key */
++static PHP_FUNCTION(suhosin_secureconfig_decrypt)
++{
++   char *plaintext, *ciphertext;
++   int plaintext_len, ciphertext_len;
++   int i;
++  
++   if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &ciphertext, &ciphertext_len) == FAILURE) {
++       return;
++   }
++
++   /* redo suhosin_encrypt_string()'s base64 alphabet transformation */
++   for (i=0; i<ciphertext_len; i++) {
++       switch (ciphertext[i]) {
++           case '/': ciphertext[i]='-'; break;
++           case '=': ciphertext[i]='.'; break;
++           case '+': ciphertext[i]='_'; break;
++       }
++   }
++   plaintext = suhosin_decrypt_string(ciphertext, ciphertext_len, "", 0, cryptkey, &plaintext_len, 0 TSRMLS_CC);
++   if(plaintext == NULL || plaintext_len <= 0) {
++       return;
++   }
++   RETURN_STRINGL((char *)plaintext, plaintext_len, 1);
++}
++
++/* }}} */
++
++
++/* {{{ suhosin_secureconfig_functions[]
++ */
++static function_entry suhosin_secureconfig_functions[] = {
++   PHP_NAMED_FE(secureconfig_encrypt, PHP_FN(suhosin_secureconfig_encrypt), NULL)
++   PHP_NAMED_FE(secureconfig_decrypt, PHP_FN(suhosin_secureconfig_decrypt), NULL)
++   {NULL, NULL, NULL}
++};
++/* }}} */
++
++
++void suhosin_hook_secureconfig()
++{
++   char* key;
++   suhosin_SHA256_CTX ctx;
++
++   TSRMLS_FETCH();
++  
++   /* check if we already have secureconfig support */
++   if (zend_hash_exists(CG(function_table), "secureconfig_encrypt", sizeof("secureconfig_encrypt"))) {
++       return;    
++   }
++
++   key = SUHOSIN_G(secureconfig_cryptkey);
++   if (key != NULL) {
++       suhosin_SHA256Init(&ctx);
++       suhosin_SHA256Update(&ctx, (unsigned char*)key, strlen(key));
++       suhosin_SHA256Final((unsigned char *)cryptkey, &ctx);
++   } else {
++       memset(cryptkey, 0x55 /*fallback key with alternating bits*/, 32);
++   }
++
++   /* add the secureconfig functions */
++#ifndef ZEND_ENGINE_2
++   zend_register_functions(suhosin_secureconfig_functions, NULL, MODULE_PERSISTENT TSRMLS_CC);
++#else
++   zend_register_functions(NULL, suhosin_secureconfig_functions, NULL, MODULE_PERSISTENT TSRMLS_CC);
++#endif
++}
++
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: sw=4 ts=4 fdm=marker
++ * vim<600: sw=4 ts=4
++ */
+diff -Naur suhosin-0.9.31.org/suhosin.c suhosin-0.9.31/suhosin.c
+--- suhosin-0.9.31.org/suhosin.c    2010-03-28 22:43:13.000000000 +0200
++++ suhosin-0.9.31/suhosin.c    2010-04-18 15:56:25.000000000 +0200
+@@ -956,6 +956,8 @@
+    STD_ZEND_INI_BOOLEAN("suhosin.srand.ignore", "1", ZEND_INI_SYSTEM|ZEND_INI_PERDIR, OnUpdateMiscBool, srand_ignore,zend_suhosin_globals, suhosin_globals)
+    STD_ZEND_INI_BOOLEAN("suhosin.mt_srand.ignore", "1", ZEND_INI_SYSTEM|ZEND_INI_PERDIR, OnUpdateMiscBool, mt_srand_ignore,zend_suhosin_globals,   suhosin_globals)
+ 
++   STD_PHP_INI_ENTRY("suhosin.secureconfig.cryptkey", "", PHP_INI_SYSTEM|PHP_INI_PERDIR, OnUpdateString, secureconfig_cryptkey, zend_suhosin_globals, suhosin_globals)
++
+ PHP_INI_END()
+ /* }}} */
+ 
+@@ -1071,6 +1073,7 @@
+    suhosin_hook_crypt();
+    suhosin_hook_sha256();
+    suhosin_hook_ex_imp();
++   suhosin_hook_secureconfig();
+ 
+    /* register the logo for phpinfo */
+    php_register_info_logo(SUHOSIN_LOGO_GUID, "image/jpeg", suhosin_logo, sizeof(suhosin_logo));
+diff -Naur suhosin-0.9.31.org/suhosin.ini suhosin-0.9.31/suhosin.ini
+--- suhosin-0.9.31.org/suhosin.ini  2010-03-28 22:43:13.000000000 +0200
++++ suhosin-0.9.31/suhosin.ini  2010-04-18 15:56:25.000000000 +0200
+@@ -443,3 +443,10 @@
+ ; .htaccess. The string "legcprsum" will allow logging, execution, get,
+ ; post, cookie, request, sql, upload, misc features in .htaccess
+ ;suhosin.perdir = "0"
++
++; Controls the cryptographic key with which configuration values can be
++; encrypted (and decrypted using (secureconfig_decrypt).
++; It is recommended that this default value should be replaced with a
++; randomly generated key (256 bit key encoded with base64).
++;suhosin.secureconfig.cryptkey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
++
